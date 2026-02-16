@@ -1,0 +1,884 @@
+---
+title: "Visium Powered by BadranSeq"
+author: "Badran Elshenawy"
+date: today
+format:
+  html:
+    theme: darkly
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    self-contained: true
+    title-block-banner: true
+engine: knitr
+execute:
+  eval: true
+  warning: false
+  message: false
+---
+
+## Context
+
+This guide provides a complete walkthrough of **Visium spatial transcriptomics analysis** using the Seurat ecosystem, enhanced with [BadranSeq](https://github.com/BadranElshenawy/BadranSeq) visualizations wherever they improve upon Seurat's defaults. The workflow follows the structure of the [Seurat spatial vignette](https://satijalab.org/seurat/articles/spatial_vignette) but restructures it into a checkpoint-based, independently executable pipeline.
+
+**What this guide covers:**
+
+- **Quality control and normalization** of 10x Visium data from the mouse brain anterior cortex
+- **Dimensionality reduction and clustering** with spatial-aware visualization
+- **Differential expression analysis** including spatially variable feature detection with Moran's I
+- **Integration with scRNA-seq reference data** for cell-type deconvolution via anchor-based label transfer
+- **Multi-slice analysis** demonstrating the merge-split-preprocess-integrate pattern
+
+**Why BadranSeq?** BadranSeq provides publication-ready `ggplot2`-based visualizations with improved defaults for color palettes, label placement, and theme consistency. Throughout this guide, Seurat's `DimPlot()`, `FeaturePlot()`, and `VlnPlot()` are replaced with their BadranSeq equivalents (`do_DimPlot()`, `do_FeaturePlot()`, `do_ViolinPlot()`), while spatial overlay functions (`SpatialFeaturePlot()`, `SpatialDimPlot()`) remain Seurat-native since BadranSeq does not yet provide spatial image overlays.
+
+## Checkpoint Convention
+
+Every code chunk in this guide is **self-contained**: it loads its own libraries, reads its input from a numbered checkpoint, and writes its output to the next checkpoint. This means any chunk can be executed independently without relying on in-memory state from previous chunks.
+
+| Checkpoint | File | Description |
+|:---:|:---|:---|
+| 01 | `01_brain_seu.rds` | Raw Seurat object from stxBrain anterior1 |
+| 02 | `02_brain_seu_normalized.rds` | SCTransform-normalized brain object |
+| 03 | `03_brain_seu_clustered.rds` | PCA, UMAP, and graph-based clustering complete |
+| 04 | `04_brain_seu_spatial_dea.rds` | Spatially variable features computed with Moran's I |
+| 05 | `05_cortex_seu.rds` | Cortex subset via coordinate-based spatial selection |
+| 06 | `06_cortex_seu_integrated.rds` | Cortex with transferred scRNA-seq annotations |
+| 07 | `07_brain_merge_seu.rds` | Merged anterior1 + posterior1 slices with joint UMAP |
+
+## Data Loading
+
+The `stxBrain` dataset from `SeuratData` contains 10x Visium data from the mouse brain. We load the **anterior1** slice, which captures the anterior cortex, hippocampus, and surrounding structures. This serves as our primary object throughout the guide.
+
+```{r}
+#| label: data-loading
+
+# Libraries ----------
+
+library(Seurat)
+library(SeuratData)
+library(readr)
+
+# Processing ----------
+
+options(timeout = 300)
+SeuratData::InstallData("stxBrain")
+brain <- SeuratData::LoadData("stxBrain", type = "anterior1")
+
+# Outputs ----------
+
+dir.create("../checkpoints", recursive = TRUE, showWarnings = FALSE)
+readr::write_rds(brain, "../checkpoints/01_brain_seu.rds", compress = "gz")
+```
+
+## Quality Control
+
+Visium spots vary dramatically in **sequencing depth and library size** because each spot captures a different number of cells depending on the local tissue density. This biological heterogeneity is visible in the spatial distribution of library sizes:
+
+- **Grey matter regions** (e.g., cortical layers, hippocampus) are neuron-dense and show higher `nCount_Spatial` values per spot
+- **White matter regions** (e.g., corpus callosum, cortical white matter) are depleted of neuronal cell bodies and exhibit lower library sizes
+
+Understanding this spatial variation is critical before normalization, as it confirms that much of the count variation reflects genuine biological differences rather than technical artifacts.
+
+```{r}
+#| label: qc-visualization
+#| fig-width: 14
+#| fig-height: 6
+
+# Libraries ----------
+
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(BadranSeq)
+library(readr)
+
+# Inputs ----------
+
+brain <- readr::read_rds("../checkpoints/01_brain_seu.rds")
+
+# Processing ----------
+
+plot1 <- BadranSeq::do_ViolinPlot(
+  brain,
+  features = "nCount_Spatial",
+  pt.size = 0.3
+) +
+  NoLegend() +
+  labs(y = "Library Size")
+
+plot2 <- SpatialFeaturePlot(
+  brain,
+  features = "nCount_Spatial"
+) +
+  theme(legend.position = "right")
+
+qc_combined <- plot1 + plot2
+
+# Outputs ----------
+
+dir.create("../write/figures/qc", recursive = TRUE, showWarnings = FALSE)
+ggsave(
+  "../write/figures/qc/library_size_qc.png",
+  qc_combined,
+  width = 14, height = 6, bg = "white"
+)
+```
+
+## Normalization
+
+Normalization removes the confounding effect of **library size variation** so that downstream comparisons reflect true expression differences. Here we apply `SCTransform`, which models UMI counts as a function of sequencing depth using regularized negative binomial regression.
+
+- **SCTransform** is used here to follow the Seurat vignette and because it performs well on spatially heterogeneous data
+- **LogNormalize** is a valid and often simpler alternative. For standard Visium workflows, `LogNormalize()` with default parameters performs comparably to SCTransform and is the approach used in many chromium and Xenium pipelines. Either method is appropriate depending on the downstream goals
+
+```{r}
+#| label: normalization
+
+# Libraries ----------
+
+library(Seurat)
+library(readr)
+
+# Inputs ----------
+
+brain <- readr::read_rds("../checkpoints/01_brain_seu.rds")
+
+# Processing ----------
+
+brain <- SCTransform(
+  brain,
+  assay = "Spatial",
+  verbose = FALSE
+)
+
+# Outputs ----------
+
+readr::write_rds(brain, "../checkpoints/02_brain_seu_normalized.rds", compress = "gz")
+```
+
+| Parameter | Value | Rationale |
+|:---|:---|:---|
+| `assay` | `"Spatial"` | Specifies the input assay containing raw Visium counts |
+| `verbose` | `FALSE` | Suppresses progress messages for cleaner output |
+
+## Gene Expression Visualization
+
+`SpatialFeaturePlot()` overlays gene expression values on the tissue image, pulling from the `data` layer of the default assay (log-transformed counts after SCTransform). Since these are standard `ggplot2` objects, all familiar customization functions apply.
+
+Two key parameters control the visual output:
+
+- **`pt.size.factor`** scales the spot size on the image. Smaller values reduce overlap between adjacent spots; larger values fill gaps
+- **`alpha`** accepts a two-element vector `c(min, max)` that maps expression intensity to transparency, making low-expression spots more transparent and highlighting spatial expression patterns
+
+```{r}
+#| label: gene-expression-viz
+#| fig-width: 14
+#| fig-height: 7
+
+# Libraries ----------
+
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(readr)
+
+# Inputs ----------
+
+brain <- readr::read_rds("../checkpoints/02_brain_seu_normalized.rds")
+
+# Processing ----------
+
+spatial_two_genes <- SpatialFeaturePlot(
+  brain,
+  features = c("Hpca", "Ttr")
+)
+
+ttr_custom <- SpatialFeaturePlot(
+  brain,
+  features = "Ttr"
+) +
+  theme(
+    legend.text = element_text(size = 0),
+    legend.title = element_text(size = 20),
+    legend.key.size = unit(1, "cm")
+  )
+
+p1 <- SpatialFeaturePlot(
+  brain,
+  features = "Ttr",
+  pt.size.factor = 1
+)
+p2 <- SpatialFeaturePlot(
+  brain,
+  features = "Ttr",
+  alpha = c(0.1, 1)
+)
+param_comparison <- p1 + p2
+
+# Outputs ----------
+
+dir.create("../write/figures/spatial_feature_plot", recursive = TRUE, showWarnings = FALSE)
+ggsave(
+  "../write/figures/spatial_feature_plot/hpca_ttr_expression.png",
+  spatial_two_genes,
+  width = 14, height = 7, bg = "white"
+)
+ggsave(
+  "../write/figures/spatial_feature_plot/ttr_expression_custom.png",
+  ttr_custom,
+  width = 7, height = 7, bg = "white"
+)
+ggsave(
+  "../write/figures/spatial_feature_plot/ttr_param_comparison.png",
+  param_comparison,
+  width = 14, height = 7, bg = "white"
+)
+```
+
+| Parameter | Value | Effect |
+|:---|:---|:---|
+| `pt.size.factor` | `1` | Reduces spot size for less overlap |
+| `alpha` | `c(0.1, 1)` | Maps expression to transparency; low expression becomes nearly invisible |
+
+## Dimensionality Reduction and Clustering
+
+The standard Seurat preprocessing pipeline applies to Visium data with minimal modification. After SCTransform normalization, we perform:
+
+- **PCA** on the SCT assay to capture the major axes of variation
+- **Graph-based clustering** using a shared nearest-neighbor graph on the first 30 PCs
+- **UMAP** for two-dimensional embedding
+
+The resulting clusters can then be visualized both in UMAP space (via `BadranSeq::do_DimPlot()`) and overlaid on the tissue image (via `SpatialDimPlot()`). Comparing these two views reveals how transcriptional clusters map to anatomical structures.
+
+```{r}
+#| label: dim-reduction-clustering
+
+# Libraries ----------
+
+library(Seurat)
+library(readr)
+
+# Inputs ----------
+
+brain <- readr::read_rds("../checkpoints/02_brain_seu_normalized.rds")
+
+# Processing ----------
+
+brain <- RunPCA(brain, assay = "SCT", verbose = FALSE)
+brain <- FindNeighbors(brain, reduction = "pca", dims = 1:30)
+brain <- FindClusters(brain, verbose = FALSE)
+brain <- RunUMAP(brain, reduction = "pca", dims = 1:30)
+
+# Outputs ----------
+
+readr::write_rds(brain, "../checkpoints/03_brain_seu_clustered.rds", compress = "gz")
+```
+
+| Parameter | Value | Rationale |
+|:---|:---|:---|
+| `dims` | `1:30` | Uses top 30 principal components; standard for spatial data |
+| `reduction` | `"pca"` | Builds neighbor graph from PCA rather than raw expression |
+
+```{r}
+#| label: cluster-visualization
+#| fig-width: 16
+#| fig-height: 8
+
+# Libraries ----------
+
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(BadranSeq)
+library(readr)
+
+# Inputs ----------
+
+brain <- readr::read_rds("../checkpoints/03_brain_seu_clustered.rds")
+
+# Processing ----------
+
+p1 <- BadranSeq::do_DimPlot(
+  brain,
+  reduction = "umap",
+  label = TRUE,
+  label.size = 3
+) +
+  NoLegend()
+
+p2 <- SpatialDimPlot(
+  brain,
+  label = TRUE,
+  label.size = 3
+) +
+  NoLegend()
+
+cluster_combined <- p1 + p2
+
+# Outputs ----------
+
+dir.create("../write/figures/dim_reduction", recursive = TRUE, showWarnings = FALSE)
+ggsave(
+  "../write/figures/dim_reduction/umap_spatial_clusters.png",
+  cluster_combined,
+  width = 16, height = 8, bg = "white"
+)
+```
+
+Individual clusters can be highlighted on the tissue image to examine their spatial distribution. This is particularly useful for confirming that clusters correspond to known anatomical regions.
+
+```{r}
+#| label: cluster-highlight
+#| fig-width: 16
+#| fig-height: 10
+
+# Libraries ----------
+
+library(Seurat)
+library(ggplot2)
+library(readr)
+
+# Inputs ----------
+
+brain <- readr::read_rds("../checkpoints/03_brain_seu_clustered.rds")
+
+# Processing ----------
+
+highlight_plot <- SpatialDimPlot(
+  brain,
+  cells.highlight = CellsByIdentities(
+    object = brain,
+    idents = c(2, 1, 4, 3, 5, 8)
+  ),
+  facet.highlight = TRUE,
+  ncol = 3
+)
+
+# Outputs ----------
+
+dir.create("../write/figures/dim_reduction", recursive = TRUE, showWarnings = FALSE)
+ggsave(
+  "../write/figures/dim_reduction/cluster_highlights.png",
+  highlight_plot,
+  width = 16, height = 10, bg = "white"
+)
+```
+
+## Interactive Visualization
+
+Seurat provides Shiny-based interactive modes for both `SpatialDimPlot()` and `SpatialFeaturePlot()`, enabling real-time exploration of cluster assignments and gene expression across the tissue. `LinkedDimPlot()` goes further by linking the UMAP embedding to the spatial image, allowing bidirectional selection between the two views.
+
+These interactive tools offer a useful starting point for exploratory analysis, though the current implementation has room for growth. For example, filtering on the spatial image does not yet propagate to the linked UMAP view, and the default interactivity options are relatively basic. Future development in this space -- potentially building on BadranSeq -- could deliver more polished interactive spatial visualization.
+
+```{r}
+#| label: interactive-spatial-dimplot
+#| eval: false
+
+# Libraries ----------
+
+library(Seurat)
+library(readr)
+
+# Inputs ----------
+
+brain <- readr::read_rds("../checkpoints/03_brain_seu_clustered.rds")
+
+# Processing ----------
+
+SpatialDimPlot(
+  object = brain,
+  interactive = TRUE
+)
+```
+
+```{r}
+#| label: interactive-spatial-featureplot
+#| eval: false
+
+# Libraries ----------
+
+library(Seurat)
+library(readr)
+
+# Inputs ----------
+
+brain <- readr::read_rds("../checkpoints/03_brain_seu_clustered.rds")
+
+# Processing ----------
+
+SpatialFeaturePlot(
+  brain,
+  features = "Ttr",
+  interactive = TRUE
+)
+```
+
+```{r}
+#| label: linked-dimplot
+#| eval: false
+
+# Libraries ----------
+
+library(Seurat)
+library(readr)
+
+# Inputs ----------
+
+brain <- readr::read_rds("../checkpoints/03_brain_seu_clustered.rds")
+
+# Processing ----------
+
+LinkedDimPlot(brain)
+```
+
+## Differential Expression Analysis
+
+Two complementary strategies for identifying spatially informative genes are demonstrated here:
+
+- **Classical DEA** with `FindMarkers()` compares expression between predefined clusters. This works well when cluster boundaries correspond to spatial structures, though this assumption does not always hold in spatial data
+- **Spatially variable feature detection** with `FindSpatiallyVariableFeatures()` directly identifies genes whose expression varies across tissue coordinates, independent of cluster assignments
+
+For spatial variability, we use **Moran's I**, a widely adopted spatial autocorrelation statistic. While effective and well-supported in the field, alternative methods such as **SpatialDE** and **Splotch** offer different statistical frameworks and are worth exploring, particularly for datasets where Moran's I may lack sensitivity to complex spatial patterns.
+
+The key visualization below compares the top 3 spatially variable features in two views: `SpatialFeaturePlot()` overlaid on the tissue image (top row) and `BadranSeq::do_FeaturePlot()` on the UMAP embedding (bottom row). This dual view highlights how spatial expression gradients correspond to the transcriptional structure captured by dimensionality reduction.
+
+```{r}
+#| label: classical-dea
+#| fig-width: 16
+#| fig-height: 7
+
+# Libraries ----------
+
+library(Seurat)
+library(ggplot2)
+library(readr)
+
+# Inputs ----------
+
+brain <- readr::read_rds("../checkpoints/03_brain_seu_clustered.rds")
+
+# Processing ----------
+
+de_markers <- FindMarkers(
+  brain,
+  ident.1 = 5,
+  ident.2 = 6
+)
+
+classical_dea_plot <- SpatialFeaturePlot(
+  object = brain,
+  features = rownames(de_markers)[1:3],
+  alpha = c(0.1, 1),
+  ncol = 3
+)
+
+# Outputs ----------
+
+dir.create("../write/figures/dea", recursive = TRUE, showWarnings = FALSE)
+ggsave(
+  "../write/figures/dea/classical_dea_top3.png",
+  classical_dea_plot,
+  width = 16, height = 7, bg = "white"
+)
+```
+
+```{r}
+#| label: spatial-dea
+#| fig-width: 16
+#| fig-height: 12
+
+# Libraries ----------
+
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(BadranSeq)
+library(readr)
+
+# Inputs ----------
+
+brain <- readr::read_rds("../checkpoints/03_brain_seu_clustered.rds")
+
+# Processing ----------
+
+brain <- FindSpatiallyVariableFeatures(
+  brain,
+  assay = "SCT",
+  features = VariableFeatures(brain)[1:1000],
+  selection.method = "moransi"
+)
+
+top.features <- head(
+  SpatiallyVariableFeatures(brain, method = "moransi"),
+  3
+)
+
+spatial_plot <- SpatialFeaturePlot(
+  brain,
+  features = top.features,
+  ncol = 3,
+  alpha = c(0.1, 1)
+)
+
+badranseq_plot <- BadranSeq::do_FeaturePlot(
+  brain,
+  features = top.features,
+  ncol = 3,
+  pt.size = 0.5
+)
+
+# Outputs ----------
+
+readr::write_rds(brain, "../checkpoints/04_brain_seu_spatial_dea.rds", compress = "gz")
+
+dir.create("../write/figures/dea", recursive = TRUE, showWarnings = FALSE)
+ggsave(
+  "../write/figures/dea/spatial_top_features.png",
+  spatial_plot,
+  width = 16, height = 6, bg = "white"
+)
+ggsave(
+  "../write/figures/dea/badranseq_top_features.png",
+  badranseq_plot,
+  width = 16, height = 6, bg = "white"
+)
+```
+
+| Parameter | Value | Rationale |
+|:---|:---|:---|
+| `features` | `VariableFeatures(brain)[1:1000]` | Tests top 1000 variable features; full genome is computationally expensive |
+| `selection.method` | `"moransi"` | Moran's I spatial autocorrelation; well-established for spatial transcriptomics |
+| `alpha` | `c(0.1, 1)` | Transparency gradient emphasizes high-expression regions on the tissue |
+| `pt.size` | `0.5` | Reduced point size in UMAP for cleaner feature overlays |
+
+## Spatial Subsetting
+
+In some workflows it is necessary to **subset the tissue to a specific anatomical region** before downstream analysis. Here we isolate the cortex by selecting relevant clusters and then applying coordinate-based spatial filtering to remove spots outside the cortical boundaries.
+
+This coordinate-based approach works but can be **fragile and dataset-specific**, as the exact pixel coordinates depend on image alignment and resolution. For production workflows, dedicated tools such as **Xenium Ranger** or interactive region-of-interest selection in **Loupe Browser** provide more robust spatial subsetting based on drawn boundaries rather than hard-coded coordinates.
+
+```{r}
+#| label: spatial-subsetting
+#| fig-width: 14
+#| fig-height: 7
+
+# Libraries ----------
+
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(readr)
+
+# Inputs ----------
+
+brain <- readr::read_rds("../checkpoints/03_brain_seu_clustered.rds")
+
+# Processing ----------
+
+cortex <- subset(brain, idents = c(1, 2, 3, 4, 6, 7))
+
+centroids <- cortex[["anterior1"]]@boundaries$centroids
+coords <- setNames(as.data.frame(centroids@coords), c("x", "y"))
+rownames(coords) <- centroids@cells
+cortex$x <- coords[colnames(cortex), "x"]
+cortex$y <- coords[colnames(cortex), "y"]
+
+cortex <- subset(cortex, y < 2719 | x > 7835, invert = TRUE)
+
+m <- (9395 - 5747) / (4960 - 7715)
+b_intercept <- 5747 - m * 7715
+cortex <- subset(cortex, y > m * x + b_intercept, invert = TRUE)
+
+p1 <- SpatialDimPlot(cortex, crop = TRUE, label = TRUE)
+p2 <- SpatialDimPlot(
+  cortex,
+  crop = FALSE,
+  label = TRUE,
+  pt.size.factor = 1,
+  label.size = 3
+)
+subset_plot <- p1 + p2
+
+# Outputs ----------
+
+readr::write_rds(cortex, "../checkpoints/05_cortex_seu.rds", compress = "gz")
+
+dir.create("../write/figures/spatial_feature_plot", recursive = TRUE, showWarnings = FALSE)
+ggsave(
+  "../write/figures/spatial_feature_plot/cortex_subset.png",
+  subset_plot,
+  width = 14, height = 7, bg = "white"
+)
+```
+
+| Parameter | Value | Rationale |
+|:---|:---|:---|
+| `idents` | `c(1, 2, 3, 4, 6, 7)` | Clusters corresponding to cortical regions |
+| `invert` | `TRUE` | Removes spots matching the coordinate filter rather than keeping them |
+| `crop` | `TRUE` / `FALSE` | Cropped view focuses on the subset; uncropped shows the subset in full-tissue context |
+
+## Integration with scRNA-seq Data
+
+Integrating Visium data with a **single-cell RNA-seq reference** enables cell-type annotation of spatial spots. Here we use the Allen Institute's adult mouse cortical cell atlas (~14,000 cells with subclass annotations) as the reference dataset.
+
+The integration follows a two-step process:
+
+1. **Preprocess the reference** independently with SCTransform, PCA, and UMAP
+2. **Re-normalize the cortex subset** from Visium with SCTransform and PCA to ensure the two datasets share a compatible feature space
+
+Comparing the Seurat default `DimPlot()` with `BadranSeq::do_DimPlot()` on the Allen reference demonstrates how BadranSeq improves label readability and color contrast for complex annotations.
+
+```{r}
+#| label: reference-preprocessing
+#| fig-width: 16
+#| fig-height: 8
+
+# Libraries ----------
+
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(BadranSeq)
+library(readr)
+
+# Inputs ----------
+
+allen_reference <- readr::read_rds("../read/allen_cortex.rds")
+cortex <- readr::read_rds("../checkpoints/05_cortex_seu.rds")
+
+# Processing ----------
+
+options(future.globals.maxSize = 8 * 1024^3)
+
+allen_reference <- SCTransform(
+  allen_reference,
+  ncells = 3000,
+  verbose = FALSE
+) |>
+  RunPCA(verbose = FALSE) |>
+  RunUMAP(dims = 1:30)
+
+cortex <- SCTransform(
+  cortex,
+  assay = "Spatial",
+  verbose = FALSE
+) |>
+  RunPCA(verbose = FALSE)
+
+a <- DimPlot(
+  allen_reference,
+  group.by = "subclass",
+  label = TRUE
+) +
+  NoLegend()
+
+b <- BadranSeq::do_DimPlot(
+  allen_reference,
+  group.by = "subclass",
+  label.size = 3.5
+) +
+  NoLegend()
+
+reference_plot <- a + b
+
+# Outputs ----------
+
+dir.create("../write/figures/integration", recursive = TRUE, showWarnings = FALSE)
+ggsave(
+  "../write/figures/integration/allen_reference_dimplot.png",
+  reference_plot,
+  width = 16, height = 8, bg = "white"
+)
+```
+
+| Parameter | Value | Rationale |
+|:---|:---|:---|
+| `ncells` | `3000` | Subsamples cells for SCTransform model estimation; speeds computation while maintaining accuracy for ~14k cell datasets |
+| `future.globals.maxSize` | `8 GiB` | Increases memory ceiling for parallel SCTransform operations |
+
+## Anchor-Based Integration
+
+Seurat's **anchor-based label transfer** identifies mutual nearest neighbors between the reference and query datasets, then uses these anchors to project reference annotations onto the spatial data. While this approach is straightforward and integrated into the Seurat ecosystem, it has notable limitations for spatial transcriptomics:
+
+- **Anchor-based methods** assume that cell types in the query and reference share similar transcriptional profiles, which may not hold when comparing dissociated single cells to Visium spots that capture multiple cells per spot
+- **Dedicated deconvolution methods** such as [cell2location](https://cell2location.readthedocs.io/) are considered the current field standard for spatial cell-type deconvolution, as they explicitly model the multi-cell composition of each spot using probabilistic frameworks
+- For production spatial analyses, exploring Python-based deconvolution tools is recommended alongside or instead of anchor-based integration
+
+```{r}
+#| label: anchor-integration
+#| fig-width: 12
+#| fig-height: 7
+
+# Libraries ----------
+
+library(Seurat)
+library(ggplot2)
+library(readr)
+
+# Inputs ----------
+
+allen_reference <- readr::read_rds("../read/allen_cortex.rds")
+cortex <- readr::read_rds("../checkpoints/05_cortex_seu.rds")
+
+# Processing ----------
+
+options(future.globals.maxSize = 8 * 1024^3)
+
+allen_reference <- SCTransform(
+  allen_reference,
+  ncells = 3000,
+  verbose = FALSE
+) |>
+  RunPCA(verbose = FALSE) |>
+  RunUMAP(dims = 1:30)
+
+cortex <- SCTransform(
+  cortex,
+  assay = "Spatial",
+  verbose = FALSE
+) |>
+  RunPCA(verbose = FALSE)
+
+anchors <- FindTransferAnchors(
+  reference = allen_reference,
+  query = cortex,
+  normalization.method = "SCT"
+)
+
+predictions.assay <- TransferData(
+  anchorset = anchors,
+  refdata = allen_reference$subclass,
+  prediction.assay = TRUE,
+  weight.reduction = cortex[["pca"]],
+  dims = 1:30
+)
+cortex[["predictions"]] <- predictions.assay
+
+DefaultAssay(cortex) <- "predictions"
+prediction_plot <- SpatialFeaturePlot(
+  cortex,
+  features = c("L2/3 IT", "L4"),
+  pt.size.factor = 1.6,
+  ncol = 2,
+  crop = TRUE
+)
+
+# Outputs ----------
+
+readr::write_rds(cortex, "../checkpoints/06_cortex_seu_integrated.rds", compress = "gz")
+
+dir.create("../write/figures/integration", recursive = TRUE, showWarnings = FALSE)
+ggsave(
+  "../write/figures/integration/label_transfer_predictions.png",
+  prediction_plot,
+  width = 12, height = 7, bg = "white"
+)
+```
+
+| Parameter | Value | Rationale |
+|:---|:---|:---|
+| `normalization.method` | `"SCT"` | Both datasets were normalized with SCTransform; must match for anchor detection |
+| `prediction.assay` | `TRUE` | Returns predictions as an assay (one feature per cell type) rather than a single label column |
+| `weight.reduction` | `cortex[["pca"]]` | Uses query PCA embeddings for weighting transfer predictions |
+| `dims` | `1:30` | Matches the dimensionality used in clustering and UMAP |
+
+## Working with Multiple Slices
+
+When analyzing **multiple tissue sections**, the recommended pattern is:
+
+1. **Merge** all slices into a single Seurat object
+2. **Split** by sample identity for independent preprocessing
+3. **Preprocess each slice separately** (normalization, variable feature selection)
+4. **Integrate** using a batch-correction method (e.g., Harmony, CCA, or RPCA)
+
+The code below demonstrates the merge-and-joint-analysis approach with anterior1 and posterior1 brain slices. Variable features from both slices are combined before joint PCA and UMAP, enabling cross-slice comparison. For larger multi-slice experiments, integration methods such as **Harmony** are recommended to explicitly correct for batch effects between tissue sections.
+
+```{r}
+#| label: multi-slice-analysis
+#| fig-width: 16
+#| fig-height: 8
+
+# Libraries ----------
+
+library(Seurat)
+library(SeuratData)
+library(ggplot2)
+library(patchwork)
+library(BadranSeq)
+library(readr)
+
+# Inputs ----------
+
+brain <- readr::read_rds("../checkpoints/03_brain_seu_clustered.rds")
+
+# Processing ----------
+
+brain2 <- SeuratData::LoadData("stxBrain", type = "posterior1")
+brain2 <- SCTransform(
+  brain2,
+  assay = "Spatial",
+  verbose = FALSE
+)
+
+brain.merge <- merge(brain, brain2)
+
+DefaultAssay(brain.merge) <- "SCT"
+VariableFeatures(brain.merge) <- c(
+  VariableFeatures(brain),
+  VariableFeatures(brain2)
+)
+brain.merge <- RunPCA(brain.merge, verbose = FALSE)
+brain.merge <- FindNeighbors(brain.merge, dims = 1:30)
+brain.merge <- FindClusters(brain.merge, verbose = FALSE)
+brain.merge <- RunUMAP(brain.merge, dims = 1:30)
+
+a <- BadranSeq::do_DimPlot(
+  brain.merge,
+  reduction = "umap",
+  group.by = "seurat_clusters"
+)
+
+b <- BadranSeq::do_DimPlot(
+  brain.merge,
+  reduction = "umap",
+  group.by = "orig.ident"
+)
+
+umap_combined <- a + b
+
+spatial_clusters <- SpatialDimPlot(brain.merge)
+
+spatial_features <- SpatialFeaturePlot(
+  brain.merge,
+  features = c("Hpca", "Plp1")
+)
+
+# Outputs ----------
+
+readr::write_rds(brain.merge, "../checkpoints/07_brain_merge_seu.rds", compress = "gz")
+
+dir.create("../write/figures/multi_slice", recursive = TRUE, showWarnings = FALSE)
+ggsave(
+  "../write/figures/multi_slice/merge_umap_comparison.png",
+  umap_combined,
+  width = 16, height = 8, bg = "white"
+)
+ggsave(
+  "../write/figures/multi_slice/merge_spatial_clusters.png",
+  spatial_clusters,
+  width = 14, height = 7, bg = "white"
+)
+ggsave(
+  "../write/figures/multi_slice/merge_spatial_features.png",
+  spatial_features,
+  width = 14, height = 7, bg = "white"
+)
+```
+
+| Parameter | Value | Rationale |
+|:---|:---|:---|
+| `VariableFeatures` | Union of both slices | Ensures the joint PCA captures variation from both tissue sections |
+| `dims` | `1:30` | Consistent dimensionality with single-slice analysis |
+| `group.by` | `"seurat_clusters"` / `"orig.ident"` | Compares cluster assignments vs. slice of origin to assess batch effects |

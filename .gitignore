@@ -1,0 +1,24 @@
+# Personal notes (contains unfiltered opinions)
+.analysis_guide_personal.qmd
+
+# RStudio project files
+.Rproj.user/
+.Rhistory
+.RData
+.Renviron
+
+# All hidden files
+.*
+!.gitignore
+
+# Claude Code
+CLAUDE.md
+
+# Rendered output
+*.html
+
+# Data and outputs (large files, not version controlled)
+# These live one level up but are listed for completeness
+../read/
+../write/
+../checkpoints/
